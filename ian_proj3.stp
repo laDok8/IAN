@@ -1,0 +1,159 @@
+global start_time, state, sum_time, task, irq_sum_time, task_work_time
+
+
+probe begin{
+    _target = target()
+    if(_target){
+        task = pid2task(_target)
+        start_time[task->cpu] = gettimeofday_ms()
+    }
+}
+
+
+probe kernel.function("hrtimer_interrupt") {
+    _curtime = gettimeofday_ms()
+    _cpu = cpu()
+    if(task){
+        _task = task_current()
+        if(_task == task){
+            task_work_time[_cpu]+= _curtime-start_time[_cpu]
+            start_time[_cpu] = _curtime
+        }
+    } else {
+        if(start_time[_cpu])
+            sum_time[_cpu,state[_cpu]]+= _curtime-start_time[_cpu]
+
+        state[_cpu] = "irq"
+        start_time[_cpu] = _curtime
+    }
+
+}
+probe kernel.function("hrtimer_interrupt").return {
+    _task = task_current()
+    _curtime = gettimeofday_ms()
+    if(task){
+        if(_task == task){
+            irq_sum_time[task->cpu]+= _curtime-start_time[task->cpu]
+            start_time[task->cpu] = _curtime
+        }
+    } else {
+        _cpu = cpu()
+        if(start_time[_cpu])
+            sum_time[_cpu,state[_cpu]]+= _curtime-start_time[_cpu]
+
+        #next state
+        start_time[_cpu] = _curtime
+        if(strpos(task_execname(_task),"swapper")==0)
+            state[_cpu] = "idle"
+        else
+            state[_cpu] = "work"
+    }
+}
+
+
+#signals probe
+probe kernel.statement("get_signal@kernel/signal.c:2569") {
+        _sig_num = $signr
+        _task = task_current()
+        if((task && _task == task) || (!task && (_sig_num == 11 || _sig_num == 19)))
+            printf("SIG=%d POINTER=%p PID=%d NAME=%s \n", _sig_num, _task, _task->pid, task_execname(_task))            
+}
+
+
+#scheduler probe - to new cpu
+probe kernel.function("set_task_cpu@kernel/sched/core.c") {
+    _t = $p
+    _cpu = $new_cpu
+    _curtime = gettimeofday_ms()
+    if(task && _t  == task){
+        #add time
+        task_work_time[_t->cpu]+= _curtime-start_time[_t->cpu]
+    } else if(!task){
+        if(start_time[_cpu])
+           sum_time[_cpu,state[_cpu]]+= _curtime-start_time[_cpu] 
+
+        start_time[_cpu] = _curtime
+        #set state of new task
+        if(strpos(task_execname(_t),"swapper")==0)
+            state[_cpu] = "idle"
+        else
+            state[_cpu] = "work"
+    }
+}
+
+#scheduler probe - change task
+probe kernel.statement("__schedule@kernel/sched/core.c:3569") {
+    #task starting
+    _curtime = gettimeofday_ms()
+
+    if(task && $next == task)
+        start_time[task->cpu] = _curtime
+
+    #task was prev
+    if(task && $prev == task)
+        task_work_time[task->cpu]+= _curtime-start_time[task->cpu]
+        
+    if(!task){
+        _cpu = cpu()
+        if(start_time[_cpu])
+            sum_time[_cpu,state[_cpu]]+= _curtime-start_time[_cpu] 
+
+        start_time[_cpu] = _curtime
+        #set state of new task
+        if(strpos(task_execname($next),"swapper")==0)
+            state[_cpu] = "idle"
+        else
+            state[_cpu] = "work"
+    }
+}
+
+function print_stat_all(){
+        #add work/irq/idle time if missing
+        foreach([cpu] in state){
+                if(!sum_time[cpu,"idle"])
+                        sum_time[cpu,"idle"]=0
+                if(!sum_time[cpu,"work"])
+                        sum_time[cpu,"work"]=0
+                if(!sum_time[cpu,"irq"])
+                        sum_time[cpu,"irq"]=0
+        }
+
+        printf("---------------------\n")
+        foreach([cpu+,st] in sum_time){
+                _runtime = sum_time[cpu,"idle"]+sum_time[cpu,"work"]+sum_time[cpu,"irq"]
+                #time to percentage
+                time = sprint(sum_time[cpu,st]*100/_runtime)." %"
+                #less than 1% and IRQ
+                if(sum_time[cpu,st]*100<=_runtime && st=="irq")
+                        time = sprint(sum_time[cpu,st])." ms"
+
+                printf("CPU:%d -  %s taken %s \n",cpu,st,time)
+        }
+        printf("---------------------\n")
+}
+
+function print_stat_task(){
+    printf("---------------------\n")
+    foreach([_cpu+] in task_work_time){
+        _runtime = irq_sum_time[_cpu]+task_work_time[_cpu]
+        irq_time = sprint(irq_sum_time[_cpu]*100/_runtime)." %"
+                if(irq_sum_time[_cpu]*100<=_runtime)
+                        irq_time = sprint(irq_sum_time[_cpu])." ms"
+        printf("CPU=%d WORK_TIME=%s%% IRQ_TIME= %s\n",_cpu,sprint(task_work_time[_cpu]*100/_runtime),irq_time)
+    }
+    printf("---------------------\n")
+}
+
+probe timer.s(5){
+    if(task)
+        print_stat_task()
+    else
+        print_stat_all()
+}
+
+probe end{
+    if(task)
+        print_stat_task()
+    else
+        print_stat_all()
+}

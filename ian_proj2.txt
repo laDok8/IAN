@@ -1,0 +1,172 @@
+> analýza pádu kernelu z vmcore
+> Ladislav Dokoupil
+>
+>
+> crash> sys
+>        ...
+>        PANIC: "Kernel panic - not syncing: softlockup: hung tasks"
+>        ...
+>
+> crash> bt
+> PID: 61     TASK: ffff8f6f76863e80  CPU: 1   COMMAND: "kworker/1:1"
+>  #0 [ffff8f6f7b243d68] machine_kexec at ffffffff8c0582ae
+>  #1 [ffff8f6f7b243dc0] __crash_kexec at ffffffff8c13d211
+>  #2 [ffff8f6f7b243e80] panic at ffffffff8c0a7d42
+>  #3 [ffff8f6f7b243f08] watchdog_timer_fn at ffffffff8c1653be
+>  #4 [ffff8f6f7b243f38] __hrtimer_run_queues at ffffffff8c11f2b8
+>  #5 [ffff8f6f7b243f88] hrtimer_interrupt at ffffffff8c11f946
+>  #6 [ffff8f6f7b243fd8] smp_apic_timer_interrupt at ffffffff8ca03002
+>  #7 [ffff8f6f7b243ff0] apic_timer_interrupt at ffffffff8ca02182
+> --- <IRQ stack> ---
+>  #8 [ffffb39780993ce8] apic_timer_interrupt at ffffffff8ca02182
+>     [exception RIP: smp_call_function_many+0x227]
+>     RIP: ffffffff8c134057  RSP: ffffb39780993d90  RFLAGS: 00000202
+>     RAX: 0000000000000003  RBX: ffff8f6f7b261cc0  RCX: 0000000000000003
+>     RDX: ffff8f6f7b2e69c0  RSI: 0000000000000000  RDI: ffff8f6f7ac359f8
+>     RBP: 0000000000000010   R8: fffffffffffffff8   R9: 000000000000000d
+>     R10: ffffe05584e84b00  R11: 0000000000000f20  R12: 0000000000000001
+>     R13: 0000000000021c80  R14: ffffffff8c02c700  R15: 0000000000000000
+>     ORIG_RAX: ffffffffffffff11  CS: 0010  SS: 0018
+>  #9 [ffffb39780993dc8] on_each_cpu at ffffffff8c1340d8
+> #10 [ffffb39780993de8] text_poke_bp at ffffffff8c02d578
+> #11 [ffffb39780993e20] __jump_label_transform at ffffffff8c02a453
+> #12 [ffffb39780993e40] arch_jump_label_transform at ffffffff8c02a48b
+> #13 [ffffb39780993e58] __jump_label_update at ffffffff8c1ce743
+> #14 [ffffb39780993e78] static_key_enable_cpuslocked at ffffffff8c1cea52
+> #15 [ffffb39780993e88] static_key_enable at ffffffff8c1cea96
+> #16 [ffffb39780993e98] process_one_work at ffffffff8c0c0a77
+> #17 [ffffb39780993ed8] worker_thread at ffffffff8c0c0cce
+> #18 [ffffb39780993f10] kthread at ffffffff8c0c7a63
+> #19 [ffffb39780993f50] ret_from_fork at ffffffff8ca001b5
+>
+> Proces kernelu na CPU1 volal nějakou funkci na ostatních jádrech a nějake jadro zřejmně nereaguje.
+>
+> crash> timer -r -C 3
+>     ...
+>     SOFTEXPIRES       EXPIRES           TTE           HRTIMER           FUNCTION
+>    1524150000000   1524150000000      -456000000  ffff8f6f7b2db4a0  ffffffff8c12ec60  <tick_sched_timer>
+>     ...
+
+Tady crash špatně ukazuje nějakou divnou hodnotu a nejsem si jistej, že
+je to úplně dobře. Správné je udělat tu analýzu smp_call_function_many,
+co dál děláš. No i tak, každopádně dobrej postřeh. Za to máš extra bod.
+
+Btw, lockup se reportuje až po 10-20 sekundách nějakého problému s CPU,
+takže se dá čekat timer opožděnej o víc než jen půl sekundy. Korektnější
+čísla jsou vidět z run queue timestampů, který tick_sched_timer udržuje:
+
+~~~
+crash> runq -T
+  CPU 0: 0.00 secs
+  CPU 1: 0.07 secs
+  CPU 2: 25.84 secs
+  CPU 3: 27.95 secs
+~~~
+
+Takže se zdá, že interrupty už jsou vyplý dýl.
+
+~~~
+crash> foreach RU kernel ps -m
+[0 00:00:27.782] [RU]  PID: 61     TASK: ffff8f6f76863e80  CPU: 1   COMMAND: "kworker/1:1"
+[0 00:00:27.998] [RU]  PID: 14     TASK: ffff8f6f7a083e80  CPU: 1   COMMAND: "watchdog/1"
+~~~
+
+A taky se zdá, že watchdog na CPU 1 je blokovanej už 28 sekund.
+
+> Vidíme, že 3. jádro má prošlý tick_sched_timer, takže je asi někde zaseklé.
+> ... alternativně jsem se stejnou informaci mohl dozvědět z analýzy funkce 
+> smp_call_function_many.
+>
+> crash> dis smp_call_function_many
+> ...
+> 0xffffffff8c134025 <smp_call_function_many+0x1f5>:      mov    0x8(%rbx),%rsi
+> 0xffffffff8c134029 <smp_call_function_many+0x1f9>:      mov    %eax,%edi
+> 0xffffffff8c13402b <smp_call_function_many+0x1fb>:      callq  0xffffffff8c87f290 <cpumask_next>
+> 0xffffffff8c134030 <smp_call_function_many+0x200>:      cmp    0x124746e(%rip),%eax        # 0xffffffff8d37b4a4
+> 0xffffffff8c134036 <smp_call_function_many+0x206>:      jae    0xffffffff8c133e9b <smp_call_function_many+0x6b>
+> 0xffffffff8c13403c <smp_call_function_many+0x20c>:      movslq %eax,%rcx
+> 0xffffffff8c13403f <smp_call_function_many+0x20f>:      mov    (%rbx),%rdx
+> 0xffffffff8c134042 <smp_call_function_many+0x212>:      add    -0x72eb2c00(,%rcx,8),%rdx
+> 0xffffffff8c13404a <smp_call_function_many+0x21a>:      mov    0x18(%rdx),%ecx
+> 0xffffffff8c13404d <smp_call_function_many+0x21d>:      and    $0x1,%ecx
+> 0xffffffff8c134050 <smp_call_function_many+0x220>:      je     0xffffffff8c13405c <smp_call_function_many+0x22c>
+> 0xffffffff8c134052 <smp_call_function_many+0x222>:      pause
+> 0xffffffff8c134054 <smp_call_function_many+0x224>:      mov    0x18(%rdx),%ecx
+> 0xffffffff8c134057 <smp_call_function_many+0x227>:      and    $0x1,%ecx
+> 0xffffffff8c13405a <smp_call_function_many+0x22a>:      jne    0xffffffff8c134052 <smp_call_function_many+0x222>
+> 0xffffffff8c13405c <smp_call_function_many+0x22c>:      jmp    0xffffffff8c134025 <smp_call_function_many+0x1f5>
+> ...
+>
+> kod ve for cyklu čeká na dokončení práce ostatních procesorů (což zjistí pomocí hodnoty zámku spinlocku)a poslední
+> uložená hodnota v RAX je návratová hodnota funkce cpumask_next, která inkrementuje index CPU, RAX=0x3 => CPU 3 neodpovída.
+
+Tohle zní jako spousta detailů, které jsi vyčetl ze zdrojáku. Škoda, že jsi
+ty zajímavý části kódu neukázal. Za to byly body.
+
+> crash> bt -sc 3
+> PID: 2818   TASK: ffff8f6f76f0be80  CPU: 3   COMMAND: "yum"
+>  #0 [fffffe000008ce50] crash_nmi_callback+0x33 at ffffffff8c04bd73
+>  #1 [fffffe000008ce58] nmi_handle+0x63 at ffffffff8c028b53
+>  #2 [fffffe000008ceb0] default_do_nmi+0x4e at ffffffff8c02901e
+>  #3 [fffffe000008ced0] do_nmi+0x112 at ffffffff8c0291d2
+>  #4 [fffffe000008cef0] end_repeat_nmi+0x1a at ffffffff8ca01bc8
+>     [exception RIP: queued_spin_lock_slowpath+0x21]
+>     RIP: ffffffff8c0f6741  RSP: ffffb39780aafc18  RFLAGS: 00000002
+>     RAX: 0000000000000001  RBX: 0000000000000010  RCX: 0000000000000002
+>     RDX: 0000000000000001  RSI: 0000000000000001  RDI: ffff8f6f7ffd2bc0
+>     RBP: ffffb39780aafd38   R8: 0000000000000000   R9: 00000000000a7d3b
+>     R10: 0000000000000000  R11: 0000000000000000  R12: 00000000014280ca
+>     R13: 0000000000000000  R14: ffff8f6f7ffd2680  R15: ffffb39780aafd38
+>     ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0000
+> --- <NMI exception stack> ---
+>  #5 [ffffb39780aafc18] queued_spin_lock_slowpath+0x21 at ffffffff8c0f6741
+>  #6 [ffffb39780aafc18] get_page_from_freelist+0x353 at ffffffff8c1de263
+>  #7 [ffffb39780aafd30] __alloc_pages_nodemask+0x11e at ffffffff8c1e083e
+>  #8 [ffffb39780aafd90] alloc_pages_vma+0x7c at ffffffff8c2420dc
+>  #9 [ffffb39780aafdd0] __handle_mm_fault+0x99b at ffffffff8c2160ab
+> #10 [ffffb39780aafe80] handle_mm_fault+0xaa at ffffffff8c216a4a
+> #11 [ffffb39780aafeb0] __do_page_fault+0x25d at ffffffff8c0673bd
+> #12 [ffffb39780aaff20] do_page_fault+0x32 at ffffffff8c067672
+> #13 [ffffb39780aaff50] async_page_fault+0x4c at ffffffff8ca0183c
+>     RIP: 00007f241d83230b  RSP: 00007ffddc9a01f8  RFLAGS: 00010202
+>     RAX: 0000559df6b906b8  RBX: 00000000001916f8  RCX: 0000559df6b9167e
+>     RDX: 000000000000065e  RSI: 00007f240247a032  RDI: 0000559df6b90fc0
+>     RBP: 00007ffddc9a0430   R8: fffffffffffffff8   R9: 0000000000000fe6
+>     R10: 0000559df6b9169e  R11: 0000559df6b906b8  R12: 0000000000000000
+>     R13: 0000559df3c2bac0  R14: 00000000000ecac4  R15: 0000559df4dd9840
+>     ORIG_RAX: ffffffffffffffff  CS: 0033  SS: 002b
+>
+> CPU3 je zacyklené ve spinlocku (queued_spin_lock_slowpath), aby mohl vstoupit do kritické sekce. Proces v tomto čekání
+> strávil příliš dlouhou dobu a když watchdog proces nemohl k CPU pristoupit vyvolal soft lockup.
+> queued_spin_lock_slowpath byl volán z funkce get_page_from_freelist, která pomocí buddy alokatoru získává elementy paměti.
+> z analýzy kódu kernelu (page_alloc.c>rmqueue_bulk) vidím, že zámek patří struktuře "struct zone".
+
+Totéž, tady jsi taky mohl ten kód vypsat.
+
+> crash> queued_spin_lock_slowpath
+> queued_spin_lock_slowpath = $1 =
+>  {void (struct qspinlock *, u32)} 0xffffffff8c0f6720
+>
+> crash> qspinlock ffff8f6f7ffd2bc0
+> struct qspinlock {
+>   val = {
+>     counter = 0x1
+>   }
+> }
+>
+> Adresa spinlocku je uložena jako první argument funkce, tudíž je v RDI: ffff8f6f7ffd2bc0.
+> V něm je uložena hodnota 0x1 = kritická sekce obsazena.
+
+Tohle je správně a bezchybně. Ještě jsi mohl ukázat tu konkrétní zónu. Lehce
+se dá najít, že je v R14:
+~~~
+crash> bt -c 3 | grep -om1 'R14: [^ ]*'
+R14: ffff8f6f7ffd2680
+crash> zone.name,lock.rlock.raw_lock.val.counter ffff8f6f7ffd2680
+  name = 0xffffffff8d0a3961 "DMA32"
+  lock.rlock.raw_lock.val.counter = 0x1
+~~~
+Here, zóna DMA32. A je to!
+Co mi ještě chybí pro kompletní report jsou zprávy z logu. Jinak dobrá práce :-)
+Celkem tak máš 19 bodů.
+--nX
