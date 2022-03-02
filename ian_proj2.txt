@@ -1,5 +1,4 @@
 > analýza pádu kernelu z vmcore
-> Ladislav Dokoupil
 >
 >
 > crash> sys
